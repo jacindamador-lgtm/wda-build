@@ -1,0 +1,123 @@
+name: build-wda-ipa
+
+# 在 GitHub 的 macOS 云机上把 WebDriverAgent 编成 ipa。
+#
+# 为什么需要这个：WDA 只能在 macOS 上用 Xcode 编译（iOS SDK + codesign 是
+# Apple 独占的），Windows/Linux 上装任何工具都绕不过去。但 GitHub 给免费的
+# macOS runner —— 公开仓库不限时长，私有仓库每月 200 分钟（macOS 按 10 倍
+# 扣，也就是实际 20 分钟，一次编译够用一次）。
+#
+# 这里刻意**不签名**（CODE_SIGNING_ALLOWED=NO）：
+# 签名必须用你自己的 Apple ID，而免费账号的证书只能在你自己电脑上通过
+# Sideloadly/AltStore 走 Apple 的认证流程拿到。所以流程拆成两段：
+#   云端：编译 → 出无签名 ipa
+#   本机：Sideloadly 用你的 Apple ID 重签 → 装进手机
+#
+# 用法：仓库页 → Actions → build-wda-ipa → Run workflow → 等 3~6 分钟
+#       → 页面底部 Artifacts 下载 WebDriverAgentRunner-ipa.zip
+
+on:
+  workflow_dispatch:
+    inputs:
+      bundle_id:
+        description: '产物 bundle id（免费 Apple ID 建议带上你的名字，避免撞车）'
+        required: false
+        default: 'com.redcut.WebDriverAgentRunner'
+      wda_ref:
+        description: 'WebDriverAgent 分支/标签（默认 master）'
+        required: false
+        default: 'master'
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 30
+
+    steps:
+      - name: 环境信息
+        run: |
+          echo "=== Xcode ==="
+          xcodebuild -version
+          echo "=== macOS ==="
+          sw_vers
+
+      - name: 拉 WebDriverAgent 源码
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "${{ inputs.wda_ref }}" \
+            https://github.com/appium/WebDriverAgent.git wda || \
+          git clone --depth 1 https://github.com/appium/WebDriverAgent.git wda
+          ls -la wda | head -30
+
+      - name: 编译（不签名）
+        working-directory: wda
+        run: |
+          set -o pipefail
+          # 只关签名，别塞多余参数：
+          #   -allowProvisioningUpdates 是不带值的开关，跟 "NO" 会被当成 action 报
+          #   "The action NO is not a supported"
+          #   CODE_SIGN_ENTITLEMENTS="" 会让 runner 丢掉必要的 entitlements，编译期就炸
+          xcodebuild build-for-testing \
+            -project WebDriverAgent.xcodeproj \
+            -scheme WebDriverAgentRunner \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath ../out \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            PRODUCT_BUNDLE_IDENTIFIER="${{ inputs.bundle_id }}" \
+            2>&1 | tee /tmp/build.log
+          echo "---- xcodebuild 退出码: ${PIPESTATUS[0]} ----"
+
+      - name: 定位 Runner.app
+        id: locate
+        run: |
+          set -euo pipefail
+          APP=$(find out/Build/Products -maxdepth 3 \
+                  -name 'WebDriverAgentRunner-Runner.app' -type d | head -1)
+          if [ -z "$APP" ]; then
+            echo "::error::没找到 WebDriverAgentRunner-Runner.app，编译可能失败了"
+            echo "---- 目录树 ----"
+            find out/Build/Products -maxdepth 4 -type d | head -40
+            echo "---- 编译日志尾部 ----"
+            tail -60 /tmp/build.log
+            exit 1
+          fi
+          echo "app=$APP" >> "$GITHUB_OUTPUT"
+          echo "找到: $APP"
+          du -sh "$APP"
+          # 打印关键信息，方便对 bundle id
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' \
+            "$APP/Info.plist" 2>/dev/null || true
+          ls "$APP/PlugIns" 2>/dev/null || true
+
+      - name: 打包成 ipa
+        run: |
+          set -euo pipefail
+          APP="${{ steps.locate.outputs.app }}"
+          rm -rf Payload WebDriverAgentRunner.ipa
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          # ipa 就是一个含 Payload/ 目录的 zip，不能带 __MACOSX
+          zip -qry WebDriverAgentRunner.ipa Payload -x '__MACOSX/*'
+          rm -rf Payload
+          ls -lh WebDriverAgentRunner.ipa
+          unzip -l WebDriverAgentRunner.ipa | head -20
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: WebDriverAgentRunner-ipa
+          path: WebDriverAgentRunner.ipa
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 编译日志（失败时也能看）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: /tmp/build.log
+          if-no-files-found: ignore
+          retention-days: 7
