@@ -1,9 +1,0 @@
-name: probe-runner
-on:
-  workflow_dispatch:
-jobs:
-  hello:
-    runs-on: ubuntu-latest
-    steps:
-      - name: echo
-        run: echo hello-from-ubuntu && uname -a
